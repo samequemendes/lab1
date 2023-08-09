@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: A lab that evolves from static to server to serverless functions.
+
+Parameters:
+
+  DynamoDBReadOnly:
+    Type: String
+    Default: arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+
+###########a
+# Creates group for the ReadOnlyAccess policy
+###########
+
+  MyanyCoUser:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: anyCoUser
+
+  anyCoIamPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DynamoDBScan
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: SpecificTable
+            Resource: "*"
+            Effect: Allow
+            Action:
+              - dynamodb:Scan
+      Users:
+        - !Ref MyanyCoUser
+
+  anyCoUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    DependsOn: MyanyCoUser
+    Properties:
+      Status: Active
+      UserName: anyCoUser
+
+###########
+# Shaved Ice VPC 
+###########
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Lab VPC IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+###########
+# Public Route Table, Public Subnet, and Public Subnet Association 
+###########
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Lab Public Route Table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Lab Public Subnet
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+###########
+# SG for Shaved Ice Web server
+###########
+
+  SISG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH, HTTP access
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Shaved Ice Web Server SG
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
+
+###########
+# static bucket 
+###########
+
+  S3HtmlBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3HtmlBucket
+      PolicyDocument:
+        Statement:
+          Action:
+            - s3:GetObject
+          Effect: Allow
+          Principal: "*"
+          Resource:
+            - !Sub "arn:aws:s3:::${S3HtmlBucket}/*"
+            - !Sub "arn:aws:s3:::${S3HtmlBucket}"
+
+  WebApp:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - anyCoUserAccessKey
+      - PublicSubnetRouteTableAssociation
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref WebAppProfile
+      InstanceType: t3.micro
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref SISG
+      SourceDestCheck: false
+      Tags:
+        - Key: Name
+          Value: Ice Cream
+      ### Need to find out the key name      
+      #KeyName: vockey
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          mkdir -p /usr/share/httpd/.aws
+          # Create config file
+          configPath=/usr/share/httpd/.aws/config
+          touch $configPath
+          echo "[profile anyCoUser]" >> $configPath
+          echo "region = ${AWS::Region}" >> $configPath
+          echo "output = json" >> $configPath
+          # Create credentials file
+          credentialsPath=/usr/share/httpd/.aws/credentials
+          touch $credentialsPath
+          echo "[anyCoUser]" >> $credentialsPath
+          echo "aws_access_key_id = ${anyCoUserAccessKey}" >> $credentialsPath
+          echo "aws_secret_access_key = ${anyCoUserAccessKey.SecretAccessKey}" >> $credentialsPath
+          # Update permissions
+          sudo chmod 775 /usr/share/httpd/.aws/*
+          yum -y update
+          cd /home/ec2-user 
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+          sudo amazon-linux-extras install php8.0 mariadb10.5 -y
+          yum -y install httpd mariadb-server wget
+          systemctl enable httpd
+          systemctl start httpd
+          systemctl enable mariadb
+          systemctl start mariadb
+          echo '<html><h1>Hello From Your Web Application Server!</h1></html>' > /var/www/html/index.html
+          find /var/www -type d -exec chmod 2775 {} \;
+          find /var/www -type f -exec chmod 0664 {} \;
+          echo '<?php phpinfo(); ?>' > /var/www/html/phpinfo.php
+          usermod -a -G apache ec2-user
+          chown -R ec2-user:apache /var/www
+          chmod 2775 /var/www
+          wget https://us-west-2-aws-training.s3.amazonaws.com/courses/SPL-TF-100-NWSSTS/v1.0.2.prod-0837bec4/scripts/setup.zip
+          unzip setup.zip
+          #database scripts
+          wget https://us-west-2-aws-training.s3.amazonaws.com/courses/SPL-TF-100-NWSSTS/v1.0.2.prod-0837bec4/scripts/sql.zip
+          unzip sql.zip
+          mysql < /home/ec2-user/create-db.sql
+          #web application files
+          wget https://us-west-2-aws-training.s3.amazonaws.com/courses/SPL-TF-100-NWSSTS/v1.0.2.prod-0837bec4/scripts/dynamic-site.zip
+          unzip dynamic-site.zip -d /var/www/html/
+          cd /var/www/html
+          chmod +x migrate-database.sh
+          COMPOSER_HOME=/var/www/html && export COMPOSER_HOME
+          php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+          php -r "if (hash_file('sha384', 'composer-setup.php') === '55ce33d7678c5a611085589f1f3ddf8b3c52d662cd01d4ba75c0ee0459970c2200a51f492d557530c71c15d8dba01eae') { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;"
+          php composer-setup.php
+          #php -r "unlink('composer-setup.php');"
+          echo 'PHP composer step 5 - composer move command' >> /home/ec2-user/ts.log
+          mv /var/www/html/composer.phar /var/www/html/composer
+          /var/www/html/composer require aws/aws-sdk-php 2>> /home/ec2-user/ts.log
+
+          # Configure the web server
+          sed -i 's/index.html/index.php/g' /etc/httpd/conf/httpd.conf
+          systemctl restart httpd 
+          echo "Setting the application parameter values in the Parameter Store..."
+          # Signal the status from cfn-init
+          /opt/aws/bin/cfn-signal --exit-code 0 --resource WebApp --region ${AWS::Region} --stack ${AWS::StackName}
+
+############
+# Instance profile for AnyCompany Ice Cream Instance (needs SSM to setup parameter store in userdata)
+############
+
+  IamPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: FullSsmAccess
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ssm:*'
+            Resource: '*'
+          - Sid: ListAndDescribe
+            Effect: Allow
+            Action:
+              - dynamodb:List*
+              - dynamodb:DescribeReservedCapacity*
+              - dynamodb:DescribeLimits
+              - dynamodb:DescribeTimeToLive
+            Resource: "*"
+          - Sid: SpecificTable
+            Effect: Allow
+            Action:
+              - dynamodb:BatchGet*
+              - dynamodb:DescribeStream
+              - dynamodb:DescribeTable
+              - dynamodb:Get*
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:Update*
+              - dynamodb:PutItem
+            Resource: arn:aws:dynamodb:*:*:table/Products
+      Roles:
+        - !Ref WebAppIamRole
+
+  DynamoDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DynamoDBAccess
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ListAndDescribe
+            Effect: Allow
+            Action:
+              - dynamodb:List*
+              - dynamodb:DescribeReservedCapacity*
+              - dynamodb:DescribeLimits
+              - dynamodb:DescribeTimeToLive
+            Resource: "*"
+          - Sid: SpecificTable
+            Effect: Allow
+            Action:
+              - dynamodb:BatchGet*
+              - dynamodb:DescribeStream
+              - dynamodb:DescribeTable
+              - dynamodb:Get*
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:Update*
+              - dynamodb:PutItem
+            Resource: arn:aws:dynamodb:*:*:table/Products
+      Roles:
+        - !Ref WebAppIamRole
+
+  WebAppIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref DynamoDBReadOnly
+
+  WebAppProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref WebAppIamRole
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Products
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+
+Outputs:
+  AwsRegion:
+    Description: AWS Region that the lab is running in
+    Value: !Ref AWS::Region
